@@ -1,0 +1,937 @@
+#!/usr/bin/env python3
+"""MarkEdit plugin manager.
+
+A standalone CLI tool to install, update, and manage MarkEdit editor plugins.
+Plugins are JavaScript files loaded from the MarkEdit scripts/ and styles/ directories.
+
+Usage:
+    markedit-plugins add <repo>         Add and install a new plugin
+    markedit-plugins install            Install all plugins from plugins.json
+    markedit-plugins list               List available plugins from GitHub org
+    markedit-plugins remove <repo>      Remove a plugin
+    markedit-plugins search [query]     Search/browse plugins and install interactively
+    markedit-plugins status             Show installed plugins and update availability
+    markedit-plugins update [repo]      Update all (or one) plugin to latest
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import hashlib
+import io
+import json
+import os
+import zipfile
+from collections.abc import Callable
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, TypedDict, cast
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+# ---------------------------------------------------------------------------
+# typed data structures
+# ---------------------------------------------------------------------------
+
+
+class _PluginRequired(TypedDict):
+    """Required fields for a plugin entry."""
+
+    repo: str
+    file: str
+
+
+class PluginConfig(_PluginRequired, total=False):
+    """A plugin entry in plugins.json (``release`` is optional)."""
+
+    release: bool
+
+
+class LockEntry(TypedDict):
+    """A per-plugin entry in plugins.lock.json."""
+
+    file: str
+    version: str
+    sha256: str
+    installed_at: str
+
+
+class PluginsConfig(TypedDict):
+    """Top-level structure of plugins.json."""
+
+    plugins: list[PluginConfig]
+
+
+class GitHubRepo(TypedDict):
+    """Subset of fields from the GitHub repos API that we access."""
+
+    name: str
+    description: str
+
+
+_DEFAULT_SCRIPTS_DIR = Path.home() / "Library/Containers/app.cyan.markedit/Data/Documents/scripts"
+SCRIPTS_DIR = Path(os.environ.get("MARKEDIT_SCRIPTS_DIR", _DEFAULT_SCRIPTS_DIR))
+CONFIG_FILE = SCRIPTS_DIR / "plugins.json"
+LOCK_FILE = SCRIPTS_DIR / "plugins.lock.json"
+CACHE_FILE = SCRIPTS_DIR / ".plugins-cache.json"
+CACHE_TTL_SECONDS = 3600  # 1 hour
+
+GITHUB_API = "https://api.github.com"
+GITHUB_RAW = "https://raw.githubusercontent.com"
+GITHUB_ORG = "MarkEdit-app"
+
+HTTP_NOT_FOUND = 404
+
+# repos that are not installable plugins (the editor itself, build tooling, etc.)
+NON_PLUGIN_REPOS = {
+    "MarkEdit",
+    "MarkEdit-api",
+    "MarkEdit-vite",
+    "MarkEdit-theming",
+    "MarkEdit-skill",
+}
+
+
+def _fail(msg: str) -> SystemExit:
+    """Build a ``SystemExit`` with *msg* (avoids f-strings directly in raise)."""
+    return SystemExit(msg)
+
+
+# ---------------------------------------------------------------------------
+# http helpers (stdlib-only, no external dependencies)
+# ---------------------------------------------------------------------------
+
+
+def fetch_bytes(url: str, *, accept: str = "application/json") -> bytes:
+    """Fetch a URL and return the raw response body.
+
+    Args:
+        url: The URL to fetch.
+        accept: The Accept header value.
+
+    Returns:
+        The response body as bytes.
+
+    Raises:
+        SystemExit: On HTTP errors or network failures.
+
+    """
+    request = Request(
+        url,
+        headers={"Accept": accept, "User-Agent": "markedit-plugins/1.0"},
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            data: bytes = response.read()
+            return data
+    except HTTPError as exc:
+        if exc.code == HTTP_NOT_FOUND:
+            msg = f"  ✗ not found: {url}"
+            raise _fail(msg) from exc
+        msg = f"  ✗ HTTP {exc.code}: {url}"
+        raise _fail(msg) from exc
+    except URLError as exc:
+        msg = f"  ✗ network error: {exc.reason}"
+        raise _fail(msg) from exc
+
+
+def fetch_json(url: str) -> Any:
+    """Fetch a URL and parse the response as JSON."""
+    return json.loads(fetch_bytes(url))
+
+
+# ---------------------------------------------------------------------------
+# config and lock file helpers
+# ---------------------------------------------------------------------------
+
+
+def content_hash(data: bytes) -> str:
+    """Return a short sha256 hex digest for change detection."""
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
+def load_config() -> PluginsConfig:
+    """Load plugins.json, creating an empty one if it doesn't exist."""
+    if not CONFIG_FILE.exists():
+        empty: PluginsConfig = {"plugins": []}
+        save_config(empty)
+        return empty
+    return cast("PluginsConfig", json.loads(CONFIG_FILE.read_text()))
+
+
+def save_config(config: PluginsConfig) -> None:
+    """Write plugins.json with pretty formatting."""
+    CONFIG_FILE.write_text(json.dumps(config, indent=2) + "\n")
+
+
+def load_lock() -> dict[str, LockEntry]:
+    """Load the lockfile, returning an empty dict if it doesn't exist."""
+    if LOCK_FILE.exists():
+        return cast("dict[str, LockEntry]", json.loads(LOCK_FILE.read_text()))
+    return {}
+
+
+def save_lock(lock: dict[str, LockEntry]) -> None:
+    """Write the lockfile with pretty formatting."""
+    LOCK_FILE.write_text(json.dumps(lock, indent=2) + "\n")
+
+
+def now_iso() -> str:
+    """Return the current UTC time as an ISO 8601 string."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def make_lock_entry(filename: str, version: str, data: bytes) -> LockEntry:
+    """Build a lock entry for a freshly installed/updated plugin."""
+    return LockEntry(
+        file=filename,
+        version=version,
+        sha256=content_hash(data),
+        installed_at=now_iso(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# plugin metadata helpers
+# ---------------------------------------------------------------------------
+
+
+def plugin_filename(plugin: PluginConfig) -> str:
+    """Extract the local filename from a plugin's file path.
+
+    Args:
+        plugin: A plugin dict with a "file" key like "dist/markedit-vim.js".
+
+    Returns:
+        Just the filename portion, e.g. "markedit-vim.js".
+
+    """
+    return plugin["file"].rsplit("/", maxsplit=1)[-1]
+
+
+def install_dir(plugin: PluginConfig) -> Path:
+    """Return the target directory for this plugin's file."""
+    return SCRIPTS_DIR
+
+
+def normalize_repo(repo: str) -> str:
+    """Expand a user-supplied name to a canonical ``owner/repo`` string.
+
+    Accepts any of these forms (case-insensitive)::
+
+        vim              → MarkEdit-app/MarkEdit-vim
+        markedit-vim     → MarkEdit-app/MarkEdit-vim
+        MarkEdit-vim     → MarkEdit-app/MarkEdit-vim
+        MarkEdit-app/vim → MarkEdit-app/MarkEdit-vim
+
+    """
+    # strip an optional org prefix so we work with just the repo name
+    if "/" in repo:
+        repo = repo.rsplit("/", maxsplit=1)[-1]
+
+    # add the MarkEdit- prefix if missing (case-insensitive check)
+    if not repo.lower().startswith("markedit-"):
+        repo = f"MarkEdit-{repo}"
+
+    return f"{GITHUB_ORG}/{repo}"
+
+
+def short_name(repo: str) -> str:
+    """Strip the org and ``MarkEdit-`` prefix for display.
+
+    ``MarkEdit-app/MarkEdit-vim`` → ``vim``
+
+    """
+    name = repo.rsplit("/", maxsplit=1)[-1]
+    if name.lower().startswith("markedit-"):
+        name = name[len("markedit-") :]
+    return name
+
+
+def find_plugin(
+    plugins: list[PluginConfig],
+    repo: str,
+) -> PluginConfig | None:
+    """Find a plugin by repo name (case-insensitive)."""
+    lower = repo.lower()
+    return next((p for p in plugins if p["repo"].lower() == lower), None)
+
+
+# ---------------------------------------------------------------------------
+# github org discovery
+# ---------------------------------------------------------------------------
+
+
+def fetch_org_repos() -> list[GitHubRepo]:
+    """Fetch all installable plugin repos from the MarkEdit-app GitHub org.
+
+    Results are cached to disk for up to ``CACHE_TTL_SECONDS`` to avoid
+    redundant API calls.
+
+    Returns:
+        Sorted list of GitHub repo dicts, excluding non-plugin repos.
+
+    """
+    # try the on-disk cache first
+    if CACHE_FILE.exists():
+        with contextlib.suppress(json.JSONDecodeError, KeyError, ValueError):
+            cache = json.loads(CACHE_FILE.read_text())
+            fetched_at = datetime.fromisoformat(cache["fetched_at"])
+            age = (datetime.now(timezone.utc) - fetched_at).total_seconds()
+            if age < CACHE_TTL_SECONDS:
+                return cast("list[GitHubRepo]", cache["repos"])
+
+    repos: list[GitHubRepo] = fetch_json(
+        f"{GITHUB_API}/orgs/{GITHUB_ORG}/repos?per_page=100",
+    )
+    plugins = [repo for repo in repos if repo["name"] not in NON_PLUGIN_REPOS]
+    result = sorted(plugins, key=lambda repo: repo["name"])
+
+    # persist to cache
+    with contextlib.suppress(OSError):
+        CACHE_FILE.write_text(
+            json.dumps({"fetched_at": now_iso(), "repos": result}, indent=2)
+            + "\n",
+        )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# resolution: download the latest build artifact for a plugin
+# ---------------------------------------------------------------------------
+
+
+def resolve_from_release(plugin: PluginConfig) -> tuple[bytes, str]:
+    """Download the plugin file from the latest GitHub Release.
+
+    Tries direct .js assets first, then falls back to extracting from .zip assets.
+
+    Args:
+        plugin: A plugin dict with "repo" and "file" keys.
+
+    Returns:
+        Tuple of (file_data, release_tag).
+
+    """
+    repo = plugin["repo"]
+    release = fetch_json(f"{GITHUB_API}/repos/{repo}/releases/latest")
+    tag = release.get("tag_name", "unknown")
+    assets = release.get("assets", [])
+
+    js_assets = [asset for asset in assets if asset["name"].endswith(".js")]
+    if js_assets:
+        data = fetch_bytes(
+            js_assets[0]["browser_download_url"],
+            accept="application/octet-stream",
+        )
+        return data, tag
+
+    # fall back to extracting from zip
+    zip_assets = [asset for asset in assets if asset["name"].endswith(".zip")]
+    if not zip_assets:
+        msg = f"  ✗ no .js or .zip asset in release {tag} for {repo}"
+        raise _fail(msg)
+
+    zip_data = fetch_bytes(
+        zip_assets[0]["browser_download_url"],
+        accept="application/octet-stream",
+    )
+    with zipfile.ZipFile(io.BytesIO(zip_data)) as archive:
+        target_name = plugin_filename(plugin)
+        js_entries = [name for name in archive.namelist() if name.endswith(".js")]
+
+        # prefer exact filename match, then fall back to any .js
+        matched_entry = next(
+            (name for name in js_entries if name.endswith(target_name)),
+            js_entries[0] if js_entries else None,
+        )
+        if matched_entry is None:
+            msg = f"  ✗ no .js file found in zip for {repo}"
+            raise _fail(msg)
+
+        data = archive.read(matched_entry)
+
+    return data, tag
+
+
+def resolve_from_raw(plugin: PluginConfig) -> tuple[bytes, str]:
+    """Download the plugin file from the repo's default branch.
+
+    Args:
+        plugin: A plugin dict with "repo" and "file" keys.
+
+    Returns:
+        Tuple of (file_data, commit_sha_prefix).
+
+    """
+    repo = plugin["repo"]
+    file_path = plugin["file"]
+
+    commits = fetch_json(
+        f"{GITHUB_API}/repos/{repo}/commits?path={file_path}&per_page=1",
+    )
+    commit_sha = commits[0]["sha"][:12] if commits else "unknown"
+
+    repo_info = fetch_json(f"{GITHUB_API}/repos/{repo}")
+    default_branch = repo_info.get("default_branch", "main")
+
+    raw_url = f"{GITHUB_RAW}/{repo}/{default_branch}/{file_path}"
+    data = fetch_bytes(raw_url, accept="application/octet-stream")
+    return data, commit_sha
+
+
+def resolve_plugin(plugin: PluginConfig) -> tuple[bytes, str]:
+    """Download the latest version of a plugin.
+
+    Dispatches to release or raw resolution based on the plugin config.
+
+    Args:
+        plugin: A plugin dict from plugins.json.
+
+    Returns:
+        Tuple of (file_data, version_string).
+
+    """
+    if plugin.get("release"):
+        return resolve_from_release(plugin)
+    return resolve_from_raw(plugin)
+
+
+# ---------------------------------------------------------------------------
+# auto-detection for new plugins
+# ---------------------------------------------------------------------------
+
+
+def auto_detect_plugin(repo: str) -> PluginConfig:
+    """Probe a GitHub repo to determine how to install it.
+
+    Checks for GitHub Releases first, then falls back to the dist/ directory.
+
+    Args:
+        repo: Full "owner/repo" string.
+
+    Returns:
+        A plugin dict ready to be added to plugins.json.
+
+    Raises:
+        SystemExit: If the plugin file cannot be detected.
+
+    """
+    plugin: PluginConfig = {"repo": repo, "file": ""}
+
+    # try github releases first
+    with contextlib.suppress(SystemExit):
+        release = fetch_json(f"{GITHUB_API}/repos/{repo}/releases/latest")
+        assets = release.get("assets", [])
+        if assets:
+            plugin["release"] = True
+            js_assets = [
+                asset for asset in assets if asset["name"].endswith(".js")
+            ]
+            if js_assets:
+                plugin["file"] = f"dist/{js_assets[0]['name']}"
+            else:
+                zip_assets = [
+                    asset for asset in assets if asset["name"].endswith(".zip")
+                ]
+                if zip_assets:
+                    repo_name = repo.rsplit("/", maxsplit=1)[-1].lower()
+                    plugin["file"] = f"dist/{repo_name}.js"
+            return plugin
+
+    # fall back to dist/ directory listing
+    with contextlib.suppress(SystemExit):
+        contents = fetch_json(f"{GITHUB_API}/repos/{repo}/contents/dist")
+        installable_files = [
+            entry
+            for entry in contents
+            if entry["name"].endswith((".js", ".css"))
+        ]
+        if installable_files:
+            plugin["file"] = f"dist/{installable_files[0]['name']}"
+            return plugin
+
+    msg = f"  ✗ could not auto-detect plugin file for {repo}"
+    raise _fail(msg)
+
+
+# ---------------------------------------------------------------------------
+# shared install logic
+# ---------------------------------------------------------------------------
+
+
+def install_plugin_file(plugin: PluginConfig, data: bytes) -> Path:
+    """Write a plugin's file to the correct directory.
+
+    Args:
+        plugin: A plugin dict with "repo" and "file" keys.
+        data: The raw file contents to write.
+
+    Returns:
+        The path where the file was saved.
+
+    """
+    target_dir = install_dir(plugin)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    save_path = target_dir / plugin_filename(plugin)
+    save_path.write_bytes(data)
+    return save_path
+
+
+# ---------------------------------------------------------------------------
+# cli scaffolding — decorator-based subcommand dispatch
+# ---------------------------------------------------------------------------
+
+parser = argparse.ArgumentParser(
+    prog="markedit-plugins",
+    description="Manage MarkEdit editor plugins.",
+)
+subparsers = parser.add_subparsers(dest="command")
+
+
+# type for subcommand handler functions
+_CommandFunc = Callable[[argparse.Namespace], None]
+
+
+def subcommand(
+    args: list[tuple[list[str], dict[str, Any]]] | None = None,
+    *,
+    help_text: str | None = None,
+    parent: argparse._SubParsersAction[argparse.ArgumentParser] = subparsers,
+    name: str | None = None,
+) -> Callable[[_CommandFunc], _CommandFunc]:
+    """Register a function as an argparse subcommand.
+
+    The function name becomes the command name (unless overridden with *name*),
+    its docstring the description. Args are passed as
+    ``[(["flags", ...], {kwargs}), ...]`` tuples forwarded to ``add_argument``,
+    and ``set_defaults(func=fn)`` wires up dispatch.
+
+    """
+
+    def decorator(func: _CommandFunc) -> _CommandFunc:
+        cmd_name = name or func.__name__
+        sub = parent.add_parser(
+            cmd_name,
+            help=help_text,
+            description=func.__doc__,
+        )
+        for arg_names, arg_kwargs in args or []:
+            sub.add_argument(*arg_names, **arg_kwargs)
+        sub.set_defaults(func=func)
+        return func
+
+    return decorator
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+
+@subcommand(help_text="install all plugins from plugins.json")
+def install(_args: argparse.Namespace) -> None:
+    """Install all plugins listed in plugins.json."""
+    config = load_config()
+    lock = load_lock()
+    plugins = config["plugins"]
+
+    if not plugins:
+        print("no plugins configured in plugins.json")
+        return
+
+    print(f"installing {len(plugins)} plugin(s)...\n")
+
+    for plugin in plugins:
+        repo = plugin["repo"]
+        filename = plugin_filename(plugin)
+        print(f"  {short_name(repo)}")
+
+        data, version = resolve_plugin(plugin)
+        install_plugin_file(plugin, data)
+
+        lock[repo] = make_lock_entry(filename, version, data)
+        print(f"    ✓ {filename} ({version})")
+
+    save_lock(lock)
+    print(f"\n✓ {len(plugins)} plugin(s) installed")
+
+
+@subcommand(
+    args=[
+        (
+            ["repo"],
+            {"nargs": "?", "help": "specific plugin to update (optional)"},
+        ),
+    ],
+    help_text="update plugins to latest versions",
+)
+def update(args: argparse.Namespace) -> None:
+    """Update plugins to their latest versions."""
+    config = load_config()
+    lock = load_lock()
+    plugins = config["plugins"]
+
+    if args.repo:
+        target_repo = normalize_repo(args.repo)
+        match = find_plugin(plugins, target_repo)
+        if match is None:
+            msg = f"error: {short_name(target_repo)} not found in plugins.json"
+            raise _fail(msg)
+        plugins = [match]
+
+    if not plugins:
+        print("no plugins to update")
+        return
+
+    updated_count = 0
+    skipped_count = 0
+
+    print(f"checking {len(plugins)} plugin(s) for updates...\n")
+
+    for plugin in plugins:
+        repo = plugin["repo"]
+        filename = plugin_filename(plugin)
+        print(f"  {short_name(repo)}")
+
+        data, version = resolve_plugin(plugin)
+        new_hash = content_hash(data)
+        old_entry = lock.get(repo)
+
+        if old_entry is not None and old_entry["sha256"] == new_hash:
+            print(f"    ✓ already up to date ({version})")
+            skipped_count += 1
+            continue
+
+        install_plugin_file(plugin, data)
+
+        old_version = (
+            old_entry["version"] if old_entry is not None else "unknown"
+        )
+        lock[repo] = make_lock_entry(filename, version, data)
+        print(f"    ↑ updated {old_version} → {version}")
+        updated_count += 1
+
+    save_lock(lock)
+    print(f"\n✓ {updated_count} updated, {skipped_count} already current")
+
+
+@subcommand(
+    args=[
+        (
+            ["repo"],
+            {
+                "help": (
+                    "GitHub repo"
+                    " (e.g. vim, MarkEdit-vim,"
+                    " or MarkEdit-app/MarkEdit-vim)"
+                ),
+            },
+        ),
+    ],
+    help_text="add and install a new plugin",
+)
+def add(args: argparse.Namespace) -> None:
+    """Add a new plugin and install it."""
+    repo = normalize_repo(args.repo)
+    name = short_name(repo)
+
+    config = load_config()
+    plugins = config["plugins"]
+
+    if find_plugin(plugins, repo) is not None:
+        msg = f"error: {name} is already in plugins.json"
+        raise _fail(msg)
+
+    print(f"detecting plugin: {name}...")
+    plugin = auto_detect_plugin(repo)
+    filename = plugin_filename(plugin)
+    print(f"  file: {plugin['file']}")
+
+    if plugin.get("release"):
+        print("  source: GitHub Releases")
+    else:
+        print("  source: raw file from default branch")
+
+    print(f"\ninstalling {filename}...")
+    data, version = resolve_plugin(plugin)
+    install_plugin_file(plugin, data)
+
+    plugins.append(plugin)
+    config["plugins"] = plugins
+    save_config(config)
+
+    lock = load_lock()
+    lock[repo] = make_lock_entry(filename, version, data)
+    save_lock(lock)
+
+    print(f"✓ added {name} ({version})")
+
+
+@subcommand(
+    args=[
+        (["repo"], {"help": "GitHub repo to remove"}),
+    ],
+    help_text="remove a plugin",
+)
+def remove(args: argparse.Namespace) -> None:
+    """Remove a plugin from config and delete its file."""
+    repo = normalize_repo(args.repo)
+    name = short_name(repo)
+
+    config = load_config()
+    plugins = config["plugins"]
+    lock = load_lock()
+
+    plugin = find_plugin(plugins, repo)
+    if plugin is None:
+        msg = f"error: {name} not found in plugins.json"
+        raise _fail(msg)
+
+    filename = plugin_filename(plugin)
+    file_path = install_dir(plugin) / filename
+    canonical = plugin["repo"]
+
+    config["plugins"] = [p for p in plugins if p["repo"] != canonical]
+    save_config(config)
+
+    lock.pop(canonical, None)
+    save_lock(lock)
+
+    if file_path.exists():
+        file_path.unlink()
+        print(f"✓ removed {name} (deleted {filename})")
+    else:
+        msg = f"✓ removed {name} from config ({filename} was not found on disk)"
+        print(msg)
+
+
+@subcommand(help_text="show plugin status and check for updates")
+def status(_args: argparse.Namespace) -> None:
+    """Show installed plugins and check for available updates."""
+    config = load_config()
+    lock = load_lock()
+    plugins = config["plugins"]
+
+    if not plugins:
+        print("no plugins configured")
+        return
+
+    print(f"{'plugin':<40} {'installed':<16} {'status'}")
+    print("─" * 72)
+
+    for plugin in plugins:
+        repo = plugin["repo"]
+        filename = plugin_filename(plugin)
+        lock_entry = lock.get(repo)
+        file_path = install_dir(plugin) / filename
+
+        if not file_path.exists():
+            plugin_status = "✗ not installed"
+            version = "—"
+        elif lock_entry is None:
+            plugin_status = "? untracked"
+            version = "—"
+        else:
+            version = lock_entry["version"][:14]
+            try:
+                data, latest_version = resolve_plugin(plugin)
+                new_hash = content_hash(data)
+                if lock_entry["sha256"] == new_hash:
+                    plugin_status = "✓ up to date"
+                else:
+                    plugin_status = f"↑ update available ({latest_version})"
+            except SystemExit:
+                plugin_status = "? check failed"
+
+        print(f"  {short_name(repo):<38} {version:<16} {plugin_status}")
+
+
+@subcommand(help_text="list available MarkEdit plugins", name="list")
+def list_plugins(_args: argparse.Namespace) -> None:
+    """List all available plugins from the MarkEdit-app GitHub org."""
+    config = load_config()
+    installed_repos = {p["repo"].lower() for p in config["plugins"]}
+
+    print(f"fetching plugins from github.com/{GITHUB_ORG}...\n")
+    repos = fetch_org_repos()
+
+    themes = [repo for repo in repos if "theme" in repo["name"].lower()]
+    extensions = [
+        repo for repo in repos if "theme" not in repo["name"].lower()
+    ]
+
+    def print_repo(repo: GitHubRepo) -> None:
+        full_name = f"{GITHUB_ORG}/{repo['name']}"
+        marker = "●" if full_name.lower() in installed_repos else "○"
+        description = repo.get("description") or "—"
+
+        # strip common suffixes for cleaner display
+        for suffix in (" for MarkEdit.", " for MarkEdit"):
+            description = description.removesuffix(suffix)
+        description = description.rstrip(".")
+
+        print(f"  {marker} {short_name(full_name):<35} {description}")
+
+    if extensions:
+        print("extensions:")
+        for repo in extensions:
+            print_repo(repo)
+
+    if themes:
+        print("\nthemes:")
+        for repo in themes:
+            print_repo(repo)
+
+    print("\n  ● = installed, ○ = not installed")
+    print("  add with: markedit-plugins add <name>")
+
+
+def _curses_picker(matches: list[GitHubRepo], installed_repos: set[str]) -> list[GitHubRepo]:
+    """Interactive curses multi-select picker. Returns selected repos to install."""
+    import curses
+
+    not_installed = [
+        repo for repo in matches
+        if f"{GITHUB_ORG}/{repo['name']}".lower() not in installed_repos
+    ]
+    selected: set[int] = set()
+    cursor = 0
+
+    def draw(stdscr: curses.window) -> list[GitHubRepo]:
+        nonlocal cursor
+        curses.curs_set(0)
+        curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
+        curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_WHITE)
+        curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
+
+        while True:
+            stdscr.erase()
+            height, width = stdscr.getmaxyx()
+
+            stdscr.addstr(0, 0, "space: toggle  enter: install  q/ctrl+c: quit", curses.A_DIM)
+
+            for i, repo in enumerate(matches):
+                row = i + 2
+                if row >= height - 1:
+                    break
+
+                full_name = f"{GITHUB_ORG}/{repo['name']}"
+                is_installed = full_name.lower() in installed_repos
+                is_selectable = not is_installed
+                is_selected = i in selected and is_selectable
+
+                description = repo.get("description") or "—"
+                for suffix in (" for MarkEdit.", " for MarkEdit"):
+                    description = description.removesuffix(suffix)
+                description = description.rstrip(".")
+
+                name_part = short_name(full_name)
+                if is_installed:
+                    marker = "●"
+                elif is_selected:
+                    marker = "✓"
+                else:
+                    marker = "○"
+
+                line = f"  {marker} {name_part:<30} {description}"
+                line = line[:width - 1]
+
+                attr = curses.A_NORMAL
+                if i == cursor:
+                    attr = curses.color_pair(2)
+                elif is_selected:
+                    attr = curses.color_pair(1)
+                elif is_installed:
+                    attr = curses.A_DIM
+
+                stdscr.addstr(row, 0, line, attr)
+
+            stdscr.addstr(height - 1, 0, f"  {len(selected)} selected", curses.A_DIM)
+            stdscr.refresh()
+
+            key = stdscr.getch()
+
+            if key in (ord("q"), 27):  # q or esc
+                return []
+            elif key in (curses.KEY_UP, ord("k")) and cursor > 0:
+                cursor -= 1
+            elif key in (curses.KEY_DOWN, ord("j")) and cursor < len(matches) - 1:
+                cursor += 1
+            elif key == ord(" "):
+                repo = matches[cursor]
+                full_name = f"{GITHUB_ORG}/{repo['name']}"
+                if full_name.lower() not in installed_repos:
+                    if cursor in selected:
+                        selected.discard(cursor)
+                    else:
+                        selected.add(cursor)
+            elif key in (curses.KEY_ENTER, ord("\n"), ord("\r")):
+                return [matches[i] for i in sorted(selected)]
+
+        return []
+
+    try:
+        return curses.wrapper(draw)
+    except KeyboardInterrupt:
+        return []
+
+
+@subcommand(
+    args=[
+        (["query"], {"nargs": "?", "default": None, "help": "filter plugins by name or description (optional)"}),
+    ],
+    help_text="search and install available MarkEdit plugins",
+)
+def search(args: argparse.Namespace) -> None:
+    """Browse and install available plugins with an interactive picker."""
+    config = load_config()
+    installed_repos = {p["repo"].lower() for p in config["plugins"]}
+
+    repos = fetch_org_repos()
+
+    if args.query:
+        query = args.query.lower()
+        matches = [
+            repo for repo in repos
+            if query in repo["name"].lower()
+            or query in (repo.get("description") or "").lower()
+        ]
+        if not matches:
+            print(f"no plugins found matching '{args.query}'")
+            return
+    else:
+        matches = repos
+
+    selected = _curses_picker(matches, installed_repos)
+
+    for repo in selected:
+        fake_args = argparse.Namespace(repo=f"{GITHUB_ORG}/{repo['name']}")
+        add(fake_args)
+
+# ---------------------------------------------------------------------------
+# entry point
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    """Parse arguments and dispatch to the registered subcommand."""
+    SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    args = parser.parse_args()
+
+    if not hasattr(args, "func"):
+        parser.print_help()
+        raise SystemExit(1)
+
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print()
+        raise SystemExit(0)
+
+
+if __name__ == "__main__":
+    main()
