@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# markedit — open files in MarkEdit.app from the terminal
+#
+# Usage:
+#   markedit [options] [file ...]
+#
+# Examples:
+#   markedit file.md              Open a file
+#   markedit file1.md file2.md    Open multiple files
+#   markedit .                    Open file picker
+#   markedit --new                New untitled document
+#   markedit --new "notes.md"     New document with suggested name
+#   echo "# Hi" | markedit -      New document from stdin
+#   markedit file.md:42           Open file and jump to line 42
+#   markedit --help               Show this help
+
+set -euo pipefail
+
+APP_NAME="MarkEdit"
+URL_SCHEME="markedit"
+
+# ──────────────────────────────────────────────
+# helpers
+# ──────────────────────────────────────────────
+
+usage() {
+  cat <<'EOF'
+Usage: markedit [options] [file ...]
+
+Open files in MarkEdit.app from the terminal.
+
+Arguments:
+  file              One or more files to open
+  file:line         Open file and jump to a line number
+  .                 Open the file picker
+  -                 Read from stdin and open as a new document
+
+Options:
+  --new [name]      Create a new document (optional filename)
+  -h, --help        Show this help message
+
+Examples:
+  markedit README.md
+  markedit chapter1.md chapter2.md
+  markedit src/notes.md:42
+  markedit --new "draft.md"
+  echo "# Hello" | markedit -
+  cat template.md | markedit -
+
+Install:
+  cp "$(pwd)/bin/markedit" /usr/local/bin/markedit
+EOF
+}
+
+urlencode() {
+  python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read(), safe=''))"
+}
+
+resolve_path() {
+  local file="$1"
+
+  case "$file" in
+  /*) printf '%s' "$file" ;;
+  *) printf '%s' "$(cd "$(dirname "$file")" && pwd)/$(basename "$file")" ;;
+  esac
+}
+
+open_at_line() {
+  local file="$1"
+  local line="$2"
+  local abs=""
+  abs=$(resolve_path "$file")
+
+  if [[ ! -f "$abs" ]]; then
+    echo "[error] $file: no such file" >&2
+    return 1
+  fi
+
+  open -a "$APP_NAME" "$abs"
+
+  # wait for the document to load, then jump to line via AppleScript + JS bridge
+  sleep 0.5
+  osascript -e "
+    tell application \"$APP_NAME\"
+      tell document 1
+        evaluate JavaScript \"webModules.selection.gotoLine({lineNumber: $line})\"
+      end tell
+    end tell
+  " >/dev/null 2>&1 || true
+}
+
+is_line_number() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+open_file() {
+  local arg="$1"
+
+  case "$arg" in
+  *:*)
+    local line="${arg##*:}"
+    local file="${arg%:*}"
+
+    if is_line_number "$line" && [[ -e "$file" ]]; then
+      open_at_line "$file" "$line"
+    else
+      open -a "$APP_NAME" "$arg"
+    fi
+    ;;
+  .)
+    open "$URL_SCHEME://open"
+    ;;
+  *)
+    open -a "$APP_NAME" "$arg"
+    ;;
+  esac
+}
+
+# ──────────────────────────────────────────────
+# main
+# ──────────────────────────────────────────────
+
+main() {
+  case "${1:-}" in
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  --new)
+    if [[ -n "${2:-}" ]]; then
+      local encoded=""
+      encoded=$(printf '%s' "$2" | urlencode)
+      open "$URL_SCHEME://new-file?filename=$encoded"
+    else
+      open "$URL_SCHEME://new-file"
+    fi
+    exit 0
+    ;;
+  -)
+    local content=""
+    content=$(cat | urlencode)
+    open "$URL_SCHEME://new-file?initial-content=$content"
+    exit 0
+    ;;
+  "")
+    open -a "$APP_NAME"
+    exit 0
+    ;;
+  esac
+
+  for arg in "$@"; do
+    open_file "$arg"
+  done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
