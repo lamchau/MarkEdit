@@ -79,6 +79,39 @@ install_tool() {
   echo "  installed $tool → $dest"
 }
 
+install_hammerspoon_module() {
+  local hs_dir="$HOME/.hammerspoon"
+  local src="$BIN_DIR/markedit-switcher.lua"
+  local dest="$hs_dir/markedit-switcher.lua"
+
+  if [[ ! -d "$hs_dir" ]]; then
+    echo "  hammerspoon not found, skipping markedit-switcher"
+    return
+  fi
+
+  if [[ ! -f "$src" ]]; then
+    echo "[error] source not found: $src" >&2
+    return
+  fi
+
+  if [[ -e "$dest" ]] || [[ -L "$dest" ]]; then
+    if [[ "$UPGRADE" == false ]] && ! confirm_overwrite "$dest"; then
+      echo "  skipped markedit-switcher.lua"
+      return
+    fi
+    rm -f "$dest"
+  fi
+
+  ln -s "$src" "$dest"
+  echo "  linked markedit-switcher.lua → $dest"
+
+  if ! grep -q 'require("markedit-switcher")' "$hs_dir/init.lua" 2>/dev/null; then
+    echo "" >> "$hs_dir/init.lua"
+    echo 'require("markedit-switcher")' >> "$hs_dir/init.lua"
+    echo "  added require(\"markedit-switcher\") to init.lua"
+  fi
+}
+
 # ──────────────────────────────────────────────
 # main
 # ──────────────────────────────────────────────
@@ -93,6 +126,9 @@ main() {
   for tool in "${TOOLS[@]}"; do
     install_tool "$tool"
   done
+
+  printf "\n"
+  install_hammerspoon_module
 
   printf "\ndone. make sure %s is in your PATH.\n" "$DEST_DIR"
 }

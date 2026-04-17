@@ -80,6 +80,7 @@ This fork adds a few extras on top of upstream MarkEdit. Most work with the [off
 ### Works with the official app
 
 - **CLI tools** — `markedit` (open files from the terminal) and `markedit-plugins` (install, update, and manage [editor plugins](https://github.com/MarkEdit-app))
+- **Quick window switcher** (Cmd+Shift+E) — [Hammerspoon](https://www.hammerspoon.org/) module to fuzzy-find and switch between open MarkEdit windows. Only active when MarkEdit is frontmost. Built with 3 languages because each fills a gap the others can't: AppleScript is the only IPC MarkEdit exposes for enumerating windows, Lua (Hammerspoon) is the only way to bind a global hotkey and intercept input without a standalone app, and JavaScript in a WebView provides the custom fuzzy-find UI that Hammerspoon's built-in chooser is too rigid to support.
 - **JS/CSS plugins** — loaded natively by MarkEdit from its extensions directory
 
 Install the CLI tools to `~/.local/bin`:

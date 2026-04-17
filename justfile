@@ -24,6 +24,17 @@ install-cli:
 upgrade-cli:
     bin/install-cli.sh --upgrade
 
+# Install Hammerspoon quick-switch module (requires Hammerspoon)
+install-switcher:
+    @if [ -d "$$HOME/.hammerspoon" ]; then \
+        ln -sf "$(pwd)/bin/markedit-switcher.lua" "$$HOME/.hammerspoon/markedit-switcher.lua"; \
+        grep -q 'require("markedit-switcher")' "$$HOME/.hammerspoon/init.lua" 2>/dev/null || \
+            echo 'require("markedit-switcher")' >> "$$HOME/.hammerspoon/init.lua"; \
+        echo "installed markedit-switcher.lua"; \
+    else \
+        echo "hammerspoon not found, skipping"; \
+    fi
+
 # Remove build artifacts
 clean:
     rm -rf build

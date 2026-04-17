@@ -4,7 +4,8 @@
 
 - `markedit` — open files in MarkEdit.app from the terminal
 - `markedit-plugins` — plugin manager (install, update, search, remove)
-- `install-cli.sh` — installs both tools to `~/.local/bin`
+- `markedit-switcher.lua` — Hammerspoon module: quick-switch between open MarkEdit windows (Cmd+Shift+E)
+- `install-cli.sh` — installs CLI tools to `~/.local/bin` and optionally links Hammerspoon module
 
 ## Installing
 
@@ -61,3 +62,14 @@ all resolve to the same thing.
   (installer always last, after the tools it installs exist)
 - Use fixup + rebase --autosquash for iterative fixes
 - Never include unrelated deletions in a commit
+
+## markedit-switcher.lua
+
+Hammerspoon module that provides a quick-switch chooser (Cmd+Shift+E)
+for jumping between open MarkEdit windows. Only active when MarkEdit
+is the frontmost app.
+
+Requires [Hammerspoon](https://www.hammerspoon.org/). The installer
+auto-detects `~/.hammerspoon/` — if present, it symlinks the module
+and adds the `require` to `init.lua`. If Hammerspoon is not installed,
+it silently skips.
