@@ -1,6 +1,9 @@
 ## System
 *.DS_Store
 
+## Build artifacts
+build/
+
 ## User settings
 xcuserdata/
 Local.xcconfig
