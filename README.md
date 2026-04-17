@@ -72,3 +72,47 @@ Please refer to the [wiki page](https://github.com/MarkEdit-app/MarkEdit/wiki/De
 ## Acknowledgments
 
 Built on [CodeMirror 6](https://codemirror.net/), with [ts-gyb](https://github.com/microsoft/ts-gyb) for code generation.
+
+## Fork Extras
+
+This fork adds a few extras on top of upstream MarkEdit. Most work with the [official signed release](https://github.com/MarkEdit-app/MarkEdit/releases/latest) — only the tab switcher requires building from source.
+
+### Works with the official app
+
+- **CLI tools** — `markedit` (open files from the terminal) and `markedit-plugins` (install, update, and manage [editor plugins](https://github.com/MarkEdit-app))
+- **JS/CSS plugins** — loaded natively by MarkEdit from its extensions directory
+
+Install the CLI tools to `~/.local/bin`:
+
+```bash
+bin/install-cli.sh           # prompts before overwriting
+bin/install-cli.sh --upgrade # skip confirmation
+```
+
+### Requires building from source
+
+- **Quick tab switcher** (Cmd+Shift+E) — fuzzy-find and switch between open tabs
+- **Always-show-tab-bar preference** — keep the tab bar visible even with a single tab
+
+Building from source produces an ad-hoc signed app (no Apple Developer account needed), but it won't have official notarization.
+
+If you have [just](https://github.com/casey/just) (`brew install just`):
+
+```bash
+just build    # ad-hoc signed Release build → build/Build/Products/Release/MarkEdit.app
+just install  # build and copy to /Applications
+just clean    # remove build artifacts
+```
+
+Or build directly with `xcodebuild`:
+
+```bash
+xcodebuild \
+    -project MarkEdit.xcodeproj \
+    -scheme MarkEditMac \
+    -configuration Release \
+    -derivedDataPath build \
+    CODE_SIGN_IDENTITY=- \
+    CODE_SIGNING_REQUIRED=NO \
+    CODE_SIGNING_ALLOWED=NO
+```

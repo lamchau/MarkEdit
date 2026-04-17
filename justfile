@@ -16,6 +16,14 @@ build:
 install: build
     cp -R build/Build/Products/Release/MarkEdit.app /Applications/MarkEdit.app
 
+# Install CLI tools (markedit + markedit-plugins) to ~/.local/bin
+install-cli:
+    bin/install-cli.sh
+
+# Upgrade CLI tools without confirmation prompts
+upgrade-cli:
+    bin/install-cli.sh --upgrade
+
 # Remove build artifacts
 clean:
     rm -rf build
