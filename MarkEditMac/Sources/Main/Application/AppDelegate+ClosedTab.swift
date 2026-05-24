@@ -86,6 +86,7 @@ extension AppDelegate {
         }
 
         if let targetWindow {
+          newWindow.setFrame(targetWindow.frame, display: false)
           targetWindow.addTabbedWindow(newWindow, ordered: .above)
           editorDocument.restoreTabPosition(tabIndex: entry.tabIndex, relativeTo: targetWindow)
         }
